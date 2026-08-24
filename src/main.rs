@@ -1,7 +1,7 @@
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 
 struct CommandSpec<'a> {
     command: &'a str,
@@ -33,11 +33,9 @@ fn tokenize(input: &str) -> Vec<String> {
                     current.push(c);
                 }
             }
-
             '\\' => {
                 escape = true;
             }
-
             '\'' => {
                 if !double_quoted {
                     single_quoted = !single_quoted;
@@ -45,14 +43,33 @@ fn tokenize(input: &str) -> Vec<String> {
                     current.push(c);
                 }
             }
-
             c if c.is_whitespace() && !double_quoted && !single_quoted => {
                 if !current.is_empty() {
                     tokens.push(current.clone());
                     current.clear();
                 }
             }
-
+            '|' if !double_quoted && !single_quoted => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+                tokens.push("|".to_string());
+            }
+            '>' if !double_quoted && !single_quoted => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+                tokens.push(">".to_string());
+            }
+            '<' if !double_quoted && !single_quoted => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+                tokens.push("<".to_string());
+            }
             _ => current.push(c),
         }
     }
@@ -62,6 +79,57 @@ fn tokenize(input: &str) -> Vec<String> {
     }
 
     tokens
+}
+
+fn parse_command<'a>(tokens: Vec<&'a str>) -> Option<CommandSpec<'a>> {
+    let command = tokens.first()?;
+
+    let mut spec = CommandSpec {
+        command,
+        args: tokens[1..].to_vec(),
+        input: None,
+        output: None,
+        append: false,
+    };
+
+    let mut i = 0;
+
+    while i < spec.args.len() {
+        if spec.args[i] == "<" {
+            if i + 1 >= spec.args.len() {
+                eprintln!("rc9: expected file after '<'");
+                return None;
+            }
+
+            spec.input = Some(spec.args[i + 1]);
+            spec.args.remove(i + 1);
+            spec.args.remove(i);
+        } else if spec.args[i] == ">" {
+            if i + 1 >= spec.args.len() {
+                eprintln!("rc9: expected file after '>'");
+                return None;
+            }
+
+            spec.output = Some(spec.args[i + 1]);
+            spec.append = false;
+            spec.args.remove(i + 1);
+            spec.args.remove(i);
+        } else if spec.args[i] == ">>" {
+            if i + 1 >= spec.args.len() {
+                eprintln!("rc9: expected file after '>>'");
+                return None;
+            }
+
+            spec.output = Some(spec.args[i + 1]);
+            spec.append = true;
+            spec.args.remove(i + 1);
+            spec.args.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+
+    Some(spec)
 }
 
 fn main() {
@@ -75,7 +143,10 @@ fn main() {
         io::stdout().flush().unwrap();
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
+
+        if io::stdin().read_line(&mut input).is_err() {
+            break;
+        }
 
         let input = input.trim();
 
@@ -88,64 +159,66 @@ fn main() {
         }
 
         let tokens = tokenize(input);
-        let mut parts = tokens.iter().map(|x| x.as_str());
 
-        let command = match parts.next() {
-            Some(cmd) => cmd,
-            None => continue,
-        };
+        let mut commands: Vec<Vec<&str>> = Vec::new();
+        let mut current = Vec::new();
+        let mut invalid_pipe = false;
 
-        let mut spec = CommandSpec {
-            command,
-            args: parts.collect(),
-            input: None,
-            output: None,
-            append: false,
-        };
-
-        let mut i = 0;
-
-        while i < spec.args.len() {
-            if spec.args[i] == "<" {
-                if i + 1 >= spec.args.len() {
-                    eprintln!("rc9: expected file after '<'");
+        for token in &tokens {
+            if token == "|" {
+                if current.is_empty() {
+                    eprintln!("rc9: invalid pipe");
+                    invalid_pipe = true;
                     break;
                 }
 
-                spec.input = Some(spec.args[i + 1]);
-
-                spec.args.remove(i + 1);
-                spec.args.remove(i);
-            } else if spec.args[i] == ">" {
-                if i + 1 >= spec.args.len() {
-                    eprintln!("rc9: expected file after '>'");
-                    break;
-                }
-
-                spec.output = Some(spec.args[i + 1]);
-                spec.append = false;
-
-                spec.args.remove(i + 1);
-                spec.args.remove(i);
-            } else if spec.args[i] == ">>" {
-                if i + 1 >= spec.args.len() {
-                    eprintln!("rc9: expected file after '>>'");
-                    break;
-                }
-
-                spec.output = Some(spec.args[i + 1]);
-                spec.append = true;
-
-                spec.args.remove(i + 1);
-                spec.args.remove(i);
+                commands.push(current);
+                current = Vec::new();
             } else {
-                i += 1;
+                current.push(token.as_str());
             }
         }
 
-        if spec.command == "cd" {
-            if let Some(path) = spec.args.first() {
+        if invalid_pipe {
+            continue;
+        }
+
+        if current.is_empty() {
+            if !commands.is_empty() {
+                eprintln!("rc9: invalid pipe");
+                continue;
+            }
+        } else {
+            commands.push(current);
+        }
+
+        if commands.is_empty() {
+            continue;
+        }
+
+        let mut specs = Vec::new();
+
+        for command_tokens in commands {
+            match parse_command(command_tokens) {
+                Some(spec) => specs.push(spec),
+                None => {
+                    specs.clear();
+                    break;
+                }
+            }
+        }
+
+        if specs.is_empty() {
+            continue;
+        }
+
+        if specs.len() == 1 && specs[0].command == "cd" {
+            if let Some(path) = specs[0].args.first() {
                 if let Err(e) = env::set_current_dir(path) {
+                    eprintln!("cd: {e}");
+                }
+            } else if let Ok(home) = env::var("HOME") {
+                if let Err(e) = env::set_current_dir(home) {
                     eprintln!("cd: {e}");
                 }
             }
@@ -153,53 +226,86 @@ fn main() {
             continue;
         }
 
-        let mut process = Command::new(spec.command);
-        process.args(&spec.args);
+        let mut children: Vec<Child> = Vec::new();
+        let mut previous_stdout = None;
 
-        if let Some(path) = spec.input {
-            match File::open(path) {
-                Ok(file) => {
-                    process.stdin(file);
+        for (index, spec) in specs.iter().enumerate() {
+            let is_first = index == 0;
+            let is_last = index == specs.len() - 1;
+
+            let mut process = Command::new(spec.command);
+            process.args(&spec.args);
+
+            if let Some(path) = spec.input {
+                match File::open(path) {
+                    Ok(file) => {
+                        process.stdin(Stdio::from(file));
+                    }
+                    Err(e) => {
+                        eprintln!("rc9: {e}");
+                        continue;
+                    }
+                }
+            } else if let Some(stdout) = previous_stdout.take() {
+                process.stdin(Stdio::from(stdout));
+            } else if !is_first {
+                process.stdin(Stdio::null());
+            }
+
+            if let Some(path) = spec.output {
+                if spec.append {
+                    match OpenOptions::new()
+                        .write(true)
+                        .append(true)
+                        .create(true)
+                        .open(path)
+                    {
+                        Ok(file) => {
+                            process.stdout(Stdio::from(file));
+                        }
+                        Err(e) => {
+                            eprintln!("rc9: {e}");
+                            continue;
+                        }
+                    }
+                } else {
+                    match File::create(path) {
+                        Ok(file) => {
+                            process.stdout(Stdio::from(file));
+                        }
+                        Err(e) => {
+                            eprintln!("rc9: {e}");
+                            continue;
+                        }
+                    }
+                }
+            } else if !is_last {
+                process.stdout(Stdio::piped());
+            }
+
+            match process.spawn() {
+                Ok(mut child) => {
+                    if !is_last && spec.output.is_none() {
+                        previous_stdout = child.stdout.take();
+                    }
+
+                    children.push(child);
+                }
+                Err(e) => {
+                    eprintln!("rc9: {}: {}", spec.command, e);
+                }
+            }
+        }
+
+        for mut child in children {
+            match child.wait() {
+                Ok(status) => {
+                    println!("exit: {status}");
                 }
                 Err(e) => {
                     eprintln!("rc9: {e}");
-                    continue;
                 }
             }
-        }
-
-        if let Some(path) = spec.output {
-            if spec.append {
-                match OpenOptions::new()
-                    .write(true)
-                    .append(true)
-                    .create(true)
-                    .open(path)
-                {
-                    Ok(file) => {
-                        process.stdout(file);
-                    }
-                    Err(e) => {
-                        eprintln!("rc9: {e}");
-                        continue;
-                    }
-                }
-            } else {
-                match File::create(path) {
-                    Ok(file) => {
-                        process.stdout(file);
-                    }
-                    Err(e) => {
-                        eprintln!("rc9: {e}");
-                        continue;
-                    }
-                }
-            }
-        }
-
-        match process.status() {
-            Ok(status) => println!("exit: {status}"),
-            Err(e) => eprintln!("rc9: {e}"),
         }
     }
 }
