@@ -6,6 +6,7 @@ use std::process::Command;
 struct CommandSpec<'a> {
     command: &'a str,
     args: Vec<&'a str>,
+    input: Option<&'a str>,
     output: Option<&'a str>,
     append: bool,
 }
@@ -18,17 +19,12 @@ fn tokenize(input: &str) -> Vec<String> {
     let mut double_quoted = false;
 
     for c in input.chars() {
-        
-        if escape{
+        if escape {
             current.push(c);
             escape = false;
             continue;
         }
 
-        if single_quoted{
-            
-        }
-        
         match c {
             '"' => {
                 if !single_quoted {
@@ -38,9 +34,10 @@ fn tokenize(input: &str) -> Vec<String> {
                 }
             }
 
-            '\\' =>{
-               escape = true; 
+            '\\' => {
+                escape = true;
             }
+
             '\'' => {
                 if !double_quoted {
                     single_quoted = !single_quoted;
@@ -49,16 +46,15 @@ fn tokenize(input: &str) -> Vec<String> {
                 }
             }
 
-            c if c.is_whitespace() && !double_quoted => {
+            c if c.is_whitespace() && !double_quoted && !single_quoted => {
                 if !current.is_empty() {
                     tokens.push(current.clone());
                     current.clear();
                 }
             }
-            
+
             _ => current.push(c),
         }
-
     }
 
     if !current.is_empty() {
@@ -102,6 +98,7 @@ fn main() {
         let mut spec = CommandSpec {
             command,
             args: parts.collect(),
+            input: None,
             output: None,
             append: false,
         };
@@ -109,7 +106,17 @@ fn main() {
         let mut i = 0;
 
         while i < spec.args.len() {
-            if spec.args[i] == ">" {
+            if spec.args[i] == "<" {
+                if i + 1 >= spec.args.len() {
+                    eprintln!("rc9: expected file after '<'");
+                    break;
+                }
+
+                spec.input = Some(spec.args[i + 1]);
+
+                spec.args.remove(i + 1);
+                spec.args.remove(i);
+            } else if spec.args[i] == ">" {
                 if i + 1 >= spec.args.len() {
                     eprintln!("rc9: expected file after '>'");
                     break;
@@ -148,6 +155,18 @@ fn main() {
 
         let mut process = Command::new(spec.command);
         process.args(&spec.args);
+
+        if let Some(path) = spec.input {
+            match File::open(path) {
+                Ok(file) => {
+                    process.stdin(file);
+                }
+                Err(e) => {
+                    eprintln!("rc9: {e}");
+                    continue;
+                }
+            }
+        }
 
         if let Some(path) = spec.output {
             if spec.append {
