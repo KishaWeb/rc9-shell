@@ -10,6 +10,64 @@ struct CommandSpec<'a> {
     append: bool,
 }
 
+fn tokenize(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut escape = false;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+
+    for c in input.chars() {
+        
+        if escape{
+            current.push(c);
+            escape = false;
+            continue;
+        }
+
+        if single_quoted{
+            
+        }
+        
+        match c {
+            '"' => {
+                if !single_quoted {
+                    double_quoted = !double_quoted;
+                } else {
+                    current.push(c);
+                }
+            }
+
+            '\\' =>{
+               escape = true; 
+            }
+            '\'' => {
+                if !double_quoted {
+                    single_quoted = !single_quoted;
+                } else {
+                    current.push(c);
+                }
+            }
+
+            c if c.is_whitespace() && !double_quoted => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+            }
+            
+            _ => current.push(c),
+        }
+
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
 fn main() {
     let home = env::var("HOME").unwrap();
     env::set_current_dir(home).unwrap();
@@ -33,7 +91,8 @@ fn main() {
             break;
         }
 
-        let mut parts = input.split_whitespace();
+        let tokens = tokenize(input);
+        let mut parts = tokens.iter().map(|x| x.as_str());
 
         let command = match parts.next() {
             Some(cmd) => cmd,
