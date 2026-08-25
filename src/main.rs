@@ -11,6 +11,30 @@ struct CommandSpec<'a> {
     append: bool,
 }
 
+fn expand_variable(variable: &str) -> String {
+    match variable {
+        "$HOME" => env::var("HOME").unwrap_or_default(),
+        "$USER" => env::var("USER").unwrap_or_default(),
+        "$SHELL" => env::var("SHELL").unwrap_or_default(),
+        "$OLDPWD" => env::var("OLDPWD").unwrap_or_default(),        
+        "$LANG" => env::var("LANG").unwrap_or_default(),
+        "$TERM" => env::var("TERM").unwrap_or_default(),        
+        "$EDITOR" => env::var("EDITOR").unwrap_or_default(),
+        "$VISUAL" => env::var("VISUAL").unwrap_or_default(),
+        "$HOSTNAME" => env::var("HOSTNAME").unwrap_or_default(),
+        "$LOGNAME" => env::var("LOGNAME").unwrap_or_default(),
+        "$TMPDIR" => env::var("TMPDIR").unwrap_or_default(),
+        "$XDG_CONFIG_HOME" => env::var("XDG_CONFIG_HOME").unwrap_or_default(),
+        "$XDG_DATA_HOME" => env::var("XDG_DATA_HOME").unwrap_or_default(),
+        "$XDG_CACHE_HOME" => env::var("XDG_CACHE_HOME").unwrap_or_default(),
+        "$XDG_RUNTIME_DIR" => env::var("XDG_RUNTIME_DIR").unwrap_or_default(),
+        "$PWD" => env::current_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        _ => variable.to_string(),
+    }
+}
+
 fn tokenize(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -158,14 +182,27 @@ fn execute_pipeline(commands: &[Vec<&str>]) {
     }
 
     if specs.len() == 1 && specs[0].command == "cd" {
+
         if let Some(path) = specs[0].args.first() {
-            if let Err(e) = env::set_current_dir(path) {
-                eprintln!("cd: {e}");
+        let oldpwd = env::current_dir().unwrap();
+
+        if let Err(e) = env::set_current_dir(path) {
+            eprintln!("cd: {e}");
+        } else {
+            unsafe {
+                env::set_var("OLDPWD", oldpwd);
             }
+        }
         } else if let Ok(home) = env::var("HOME") {
-            if let Err(e) = env::set_current_dir(home) {
-                eprintln!("cd: {e}");
+        let oldpwd = env::current_dir().unwrap();
+
+        if let Err(e) = env::set_current_dir(home) {
+            eprintln!("cd: {e}");
+        } else {
+            unsafe {
+                env::set_var("OLDPWD", oldpwd);
             }
+        }
         }
 
         return;
@@ -179,7 +216,14 @@ fn execute_pipeline(commands: &[Vec<&str>]) {
         let is_last = index == specs.len() - 1;
 
         let mut process = Command::new(spec.command);
-        process.args(&spec.args);
+
+        let expanded_args: Vec<String> = spec
+            .args
+            .iter()
+            .map(|arg| expand_variable(arg))
+            .collect();
+
+        process.args(&expanded_args);
 
         if let Some(path) = spec.input {
             match File::open(path) {
