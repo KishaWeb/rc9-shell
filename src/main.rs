@@ -16,9 +16,9 @@ fn expand_variable(variable: &str) -> String {
         "$HOME" => env::var("HOME").unwrap_or_default(),
         "$USER" => env::var("USER").unwrap_or_default(),
         "$SHELL" => env::var("SHELL").unwrap_or_default(),
-        "$OLDPWD" => env::var("OLDPWD").unwrap_or_default(),        
+        "$OLDPWD" => env::var("OLDPWD").unwrap_or_default(),
         "$LANG" => env::var("LANG").unwrap_or_default(),
-        "$TERM" => env::var("TERM").unwrap_or_default(),        
+        "$TERM" => env::var("TERM").unwrap_or_default(),
         "$EDITOR" => env::var("EDITOR").unwrap_or_default(),
         "$VISUAL" => env::var("VISUAL").unwrap_or_default(),
         "$HOSTNAME" => env::var("HOSTNAME").unwrap_or_default(),
@@ -42,10 +42,16 @@ fn tokenize(input: &str) -> Vec<String> {
     let mut single_quoted = false;
     let mut double_quoted = false;
 
-    for c in input.chars() {
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
         if escape {
             current.push(c);
             escape = false;
+            i += 1;
             continue;
         }
 
@@ -57,9 +63,11 @@ fn tokenize(input: &str) -> Vec<String> {
                     current.push(c);
                 }
             }
+
             '\\' => {
                 escape = true;
             }
+
             '\'' => {
                 if !double_quoted {
                     single_quoted = !single_quoted;
@@ -67,42 +75,80 @@ fn tokenize(input: &str) -> Vec<String> {
                     current.push(c);
                 }
             }
+
             c if c.is_whitespace() && !double_quoted && !single_quoted => {
                 if !current.is_empty() {
                     tokens.push(current.clone());
                     current.clear();
                 }
             }
+
+            '&' if !double_quoted && !single_quoted => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+
+                if i + 1 < chars.len() && chars[i + 1] == '&' {
+                    tokens.push("&&".to_string());
+                    i += 1;
+                } else {
+                    current.push('&');
+                }
+            }
+
             '|' if !double_quoted && !single_quoted => {
                 if !current.is_empty() {
                     tokens.push(current.clone());
                     current.clear();
                 }
-                tokens.push("|".to_string());
+
+                if i + 1 < chars.len() && chars[i + 1] == '|' {
+                    tokens.push("||".to_string());
+                    i += 1;
+                } else {
+                    tokens.push("|".to_string());
+                }
             }
+
             '>' if !double_quoted && !single_quoted => {
                 if !current.is_empty() {
                     tokens.push(current.clone());
                     current.clear();
                 }
-                tokens.push(">".to_string());
+
+                if i + 1 < chars.len() && chars[i + 1] == '>' {
+                    tokens.push(">>".to_string());
+                    i += 1;
+                } else {
+                    tokens.push(">".to_string());
+                }
             }
+
             '<' if !double_quoted && !single_quoted => {
                 if !current.is_empty() {
                     tokens.push(current.clone());
                     current.clear();
                 }
+
                 tokens.push("<".to_string());
             }
+
             ';' if !double_quoted && !single_quoted => {
                 if !current.is_empty() {
                     tokens.push(current.clone());
                     current.clear();
                 }
+
                 tokens.push(";".to_string());
             }
-            _ => current.push(c),
+
+            _ => {
+                current.push(c);
+            }
         }
+
+        i += 1;
     }
 
     if !current.is_empty() {
@@ -163,9 +209,9 @@ fn parse_command<'a>(tokens: Vec<&'a str>) -> Option<CommandSpec<'a>> {
     Some(spec)
 }
 
-fn execute_pipeline(commands: &[Vec<&str>]) {
+fn execute_pipeline(commands: &[Vec<&str>]) -> bool {
     if commands.is_empty() {
-        return;
+        return false;
     }
 
     let mut specs = Vec::new();
@@ -173,43 +219,57 @@ fn execute_pipeline(commands: &[Vec<&str>]) {
     for command_tokens in commands {
         match parse_command(command_tokens.clone()) {
             Some(spec) => specs.push(spec),
-            None => return,
+            None => return false,
         }
     }
 
     if specs.is_empty() {
-        return;
+        return false;
     }
 
     if specs.len() == 1 && specs[0].command == "cd" {
-
         if let Some(path) = specs[0].args.first() {
-        let oldpwd = env::current_dir().unwrap();
+            let oldpwd = match env::current_dir() {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("cd: {e}");
+                    return false;
+                }
+            };
 
-        if let Err(e) = env::set_current_dir(path) {
-            eprintln!("cd: {e}");
-        } else {
+            if let Err(e) = env::set_current_dir(path) {
+                eprintln!("cd: {e}");
+                return false;
+            }
+
             unsafe {
                 env::set_var("OLDPWD", oldpwd);
             }
-        }
         } else if let Ok(home) = env::var("HOME") {
-        let oldpwd = env::current_dir().unwrap();
+            let oldpwd = match env::current_dir() {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("cd: {e}");
+                    return false;
+                }
+            };
 
-        if let Err(e) = env::set_current_dir(home) {
-            eprintln!("cd: {e}");
-        } else {
+            if let Err(e) = env::set_current_dir(home) {
+                eprintln!("cd: {e}");
+                return false;
+            }
+
             unsafe {
                 env::set_var("OLDPWD", oldpwd);
             }
         }
-        }
 
-        return;
+        return true;
     }
 
     let mut children: Vec<Child> = Vec::new();
     let mut previous_stdout = None;
+    let mut success = true;
 
     for (index, spec) in specs.iter().enumerate() {
         let is_first = index == 0;
@@ -232,7 +292,7 @@ fn execute_pipeline(commands: &[Vec<&str>]) {
                 }
                 Err(e) => {
                     eprintln!("rc9: {e}");
-                    return;
+                    return false;
                 }
             }
         } else if let Some(stdout) = previous_stdout.take() {
@@ -254,7 +314,7 @@ fn execute_pipeline(commands: &[Vec<&str>]) {
                     }
                     Err(e) => {
                         eprintln!("rc9: {e}");
-                        return;
+                        return false;
                     }
                 }
             } else {
@@ -264,7 +324,7 @@ fn execute_pipeline(commands: &[Vec<&str>]) {
                     }
                     Err(e) => {
                         eprintln!("rc9: {e}");
-                        return;
+                        return false;
                     }
                 }
             }
@@ -280,8 +340,10 @@ fn execute_pipeline(commands: &[Vec<&str>]) {
 
                 children.push(child);
             }
+
             Err(e) => {
                 eprintln!("rc9: {}: {}", spec.command, e);
+                return false;
             }
         }
     }
@@ -290,16 +352,25 @@ fn execute_pipeline(commands: &[Vec<&str>]) {
         match child.wait() {
             Ok(status) => {
                 println!("exit: {status}");
+
+                if !status.success() {
+                    success = false;
+                }
             }
+
             Err(e) => {
                 eprintln!("rc9: {e}");
+                success = false;
             }
         }
     }
+
+    success
 }
 
 fn main() {
     let home = env::var("HOME").unwrap();
+
     env::set_current_dir(home).unwrap();
 
     loop {
@@ -326,9 +397,12 @@ fn main() {
 
         let tokens = tokenize(input);
 
-        let mut pipelines: Vec<Vec<Vec<&str>>> = Vec::new();
+        let mut commands: Vec<Vec<Vec<&str>>> = Vec::new();
+        let mut operators: Vec<&str> = Vec::new();
+
         let mut pipeline: Vec<Vec<&str>> = Vec::new();
         let mut current: Vec<&str> = Vec::new();
+
         let mut invalid = false;
 
         for token in &tokens {
@@ -343,7 +417,8 @@ fn main() {
                     pipeline.push(current);
                     current = Vec::new();
                 }
-                ";" => {
+
+                "&&" | "||" | ";" => {
                     if current.is_empty() {
                         eprintln!("rc9: invalid command");
                         invalid = true;
@@ -353,9 +428,12 @@ fn main() {
                     pipeline.push(current);
                     current = Vec::new();
 
-                    pipelines.push(pipeline);
+                    commands.push(pipeline);
                     pipeline = Vec::new();
+
+                    operators.push(token.as_str());
                 }
+
                 _ => {
                     current.push(token.as_str());
                 }
@@ -374,11 +452,34 @@ fn main() {
         }
 
         if !pipeline.is_empty() {
-            pipelines.push(pipeline);
+            commands.push(pipeline);
         }
 
-        for pipeline in pipelines {
-            execute_pipeline(&pipeline);
+        if commands.len() != operators.len() + 1 {
+            eprintln!("rc9: invalid command chain");
+            continue;
+        }
+
+        let mut previous_status = true;
+
+        for (index, command) in commands.iter().enumerate() {
+            if index > 0 {
+                let operator = operators[index - 1];
+
+                match operator {
+                    "&&" if !previous_status => {
+                        continue;
+                    }
+
+                    "||" if previous_status => {
+                        continue;
+                    }
+
+                    _ => {}
+                }
+            }
+
+            previous_status = execute_pipeline(command);
         }
     }
 }
