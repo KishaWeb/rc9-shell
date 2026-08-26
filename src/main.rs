@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -11,7 +12,68 @@ struct CommandSpec<'a> {
     append: bool,
 }
 
-fn expand_variable(variable: &str) -> String {
+struct Shell {
+    variables: HashMap<String, String>,
+}
+
+impl Shell {
+    fn new() -> Self {
+        Self {
+            variables: HashMap::new(),
+        }
+    }
+
+    fn set_variable(&mut self, name: &str, value: &str) {
+        self.variables.insert(name.to_string(), value.to_string());
+    }
+
+    fn get_variable(&self, name: &str) -> Option<&String> {
+        self.variables.get(name)
+    }
+
+    fn expand(&self, input: &str) -> String {
+        let mut result = String::new();
+        let chars: Vec<char> = input.chars().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            if chars[i] == '$' {
+                let mut name = String::new();
+                let mut j = i + 1;
+
+                while j < chars.len() {
+                    let c = chars[j];
+
+                    if c.is_alphanumeric() || c == '_' {
+                        name.push(c);
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if !name.is_empty() {
+                    if let Some(value) = self.get_variable(&name) {
+                        result.push_str(value);
+                    } else {
+                        let variable = format!("${name}");
+                        result.push_str(&expand_environment_variable(&variable));
+                    }
+
+                    i = j;
+                    continue;
+                }
+            }
+
+            result.push(chars[i]);
+            i += 1;
+        }
+
+        result
+    }
+}
+
+fn expand_environment_variable(variable: &str) -> String {
     match variable {
         "$HOME" => env::var("HOME").unwrap_or_default(),
         "$USER" => env::var("USER").unwrap_or_default(),
@@ -209,7 +271,7 @@ fn parse_command<'a>(tokens: Vec<&'a str>) -> Option<CommandSpec<'a>> {
     Some(spec)
 }
 
-fn execute_pipeline(commands: &[Vec<&str>]) -> bool {
+fn execute_pipeline(shell: &Shell, commands: &[Vec<&str>]) -> bool {
     if commands.is_empty() {
         return false;
     }
@@ -229,6 +291,8 @@ fn execute_pipeline(commands: &[Vec<&str>]) -> bool {
 
     if specs.len() == 1 && specs[0].command == "cd" {
         if let Some(path) = specs[0].args.first() {
+            let path = shell.expand(path);
+
             let oldpwd = match env::current_dir() {
                 Ok(path) => path,
                 Err(e) => {
@@ -275,17 +339,19 @@ fn execute_pipeline(commands: &[Vec<&str>]) -> bool {
         let is_first = index == 0;
         let is_last = index == specs.len() - 1;
 
-        let mut process = Command::new(spec.command);
+        let mut process = Command::new(shell.expand(spec.command));
 
         let expanded_args: Vec<String> = spec
             .args
             .iter()
-            .map(|arg| expand_variable(arg))
+            .map(|arg| shell.expand(arg))
             .collect();
 
         process.args(&expanded_args);
 
         if let Some(path) = spec.input {
+            let path = shell.expand(path);
+
             match File::open(path) {
                 Ok(file) => {
                     process.stdin(Stdio::from(file));
@@ -302,6 +368,8 @@ fn execute_pipeline(commands: &[Vec<&str>]) -> bool {
         }
 
         if let Some(path) = spec.output {
+            let path = shell.expand(path);
+
             if spec.append {
                 match OpenOptions::new()
                     .write(true)
@@ -351,8 +419,6 @@ fn execute_pipeline(commands: &[Vec<&str>]) -> bool {
     for mut child in children {
         match child.wait() {
             Ok(status) => {
-                println!("exit: {status}");
-
                 if !status.success() {
                     success = false;
                 }
@@ -372,6 +438,8 @@ fn main() {
     let home = env::var("HOME").unwrap();
 
     env::set_current_dir(home).unwrap();
+
+    let mut shell = Shell::new();
 
     loop {
         let dir = env::current_dir().unwrap();
@@ -396,6 +464,15 @@ fn main() {
         }
 
         let tokens = tokenize(input);
+
+        if tokens.len() == 1 && tokens[0].contains('=') {
+            let parts: Vec<&str> = tokens[0].splitn(2, '=').collect();
+
+            if parts.len() == 2 && !parts[0].is_empty() {
+                shell.set_variable(parts[0], parts[1]);
+                continue;
+            }
+        }
 
         let mut commands: Vec<Vec<Vec<&str>>> = Vec::new();
         let mut operators: Vec<&str> = Vec::new();
@@ -479,7 +556,7 @@ fn main() {
                 }
             }
 
-            previous_status = execute_pipeline(command);
+            previous_status = execute_pipeline(&shell, command);
         }
     }
 }
