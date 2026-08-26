@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
 use std::process::{Child, Command, Stdio};
+
+use rustyline::error::ReadlineError;
 
 struct CommandSpec<'a> {
     command: &'a str,
@@ -13,7 +14,7 @@ struct CommandSpec<'a> {
 }
 
 struct Shell {
-    variables: HashMap<String, String>,
+    variables: HashMap<String, Vec<String>>,
 }
 
 impl Shell {
@@ -23,53 +24,26 @@ impl Shell {
         }
     }
 
-    fn set_variable(&mut self, name: &str, value: &str) {
-        self.variables.insert(name.to_string(), value.to_string());
+    fn set_variable(&mut self, name: &str, value: Vec<String>) {
+        self.variables.insert(name.to_string(), value);
     }
 
-    fn get_variable(&self, name: &str) -> Option<&String> {
+    fn get_variable(&self, name: &str) -> Option<&Vec<String>> {
         self.variables.get(name)
     }
 
-    fn expand(&self, input: &str) -> String {
-        let mut result = String::new();
-        let chars: Vec<char> = input.chars().collect();
-        let mut i = 0;
+    fn expand(&self, input: &str) -> Vec<String> {
+        if input.starts_with('$') {
+            let name = &input[1..];
 
-        while i < chars.len() {
-            if chars[i] == '$' {
-                let mut name = String::new();
-                let mut j = i + 1;
-
-                while j < chars.len() {
-                    let c = chars[j];
-
-                    if c.is_alphanumeric() || c == '_' {
-                        name.push(c);
-                        j += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                if !name.is_empty() {
-                    if let Some(value) = self.get_variable(&name) {
-                        result.push_str(value);
-                    } else {
-                        let variable = format!("${name}");
-                        result.push_str(&expand_environment_variable(&variable));
-                    }
-
-                    i = j;
-                    continue;
-                }
+            if let Some(value) = self.get_variable(name) {
+                return value.clone();
             }
 
-            result.push(chars[i]);
-            i += 1;
+            return vec![expand_environment_variable(input)];
         }
 
-        result
+        vec![input.to_string()]
     }
 }
 
@@ -136,6 +110,33 @@ fn tokenize(input: &str) -> Vec<String> {
                 } else {
                     current.push(c);
                 }
+            }
+
+            '(' if !double_quoted && !single_quoted => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+
+                tokens.push("(".to_string());
+            }
+
+            ')' if !double_quoted && !single_quoted => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+
+                tokens.push(")".to_string());
+            }
+
+            '=' if !double_quoted && !single_quoted => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+
+                tokens.push("=".to_string());
             }
 
             c if c.is_whitespace() && !double_quoted && !single_quoted => {
@@ -291,7 +292,11 @@ fn execute_pipeline(shell: &Shell, commands: &[Vec<&str>]) -> bool {
 
     if specs.len() == 1 && specs[0].command == "cd" {
         if let Some(path) = specs[0].args.first() {
-            let path = shell.expand(path);
+            let expanded = shell.expand(path);
+
+            let Some(path) = expanded.first() else {
+                return false;
+            };
 
             let oldpwd = match env::current_dir() {
                 Ok(path) => path,
@@ -339,23 +344,34 @@ fn execute_pipeline(shell: &Shell, commands: &[Vec<&str>]) -> bool {
         let is_first = index == 0;
         let is_last = index == specs.len() - 1;
 
-        let mut process = Command::new(shell.expand(spec.command));
+        let expanded_command = shell.expand(spec.command);
+
+        let Some(command) = expanded_command.first() else {
+            return false;
+        };
+
+        let mut process = Command::new(command);
 
         let expanded_args: Vec<String> = spec
             .args
             .iter()
-            .map(|arg| shell.expand(arg))
+            .flat_map(|arg| shell.expand(arg))
             .collect();
 
         process.args(&expanded_args);
 
         if let Some(path) = spec.input {
-            let path = shell.expand(path);
+            let expanded = shell.expand(path);
+
+            let Some(path) = expanded.first() else {
+                return false;
+            };
 
             match File::open(path) {
                 Ok(file) => {
                     process.stdin(Stdio::from(file));
                 }
+
                 Err(e) => {
                     eprintln!("rc9: {e}");
                     return false;
@@ -368,7 +384,11 @@ fn execute_pipeline(shell: &Shell, commands: &[Vec<&str>]) -> bool {
         }
 
         if let Some(path) = spec.output {
-            let path = shell.expand(path);
+            let expanded = shell.expand(path);
+
+            let Some(path) = expanded.first() else {
+                return false;
+            };
 
             if spec.append {
                 match OpenOptions::new()
@@ -380,6 +400,7 @@ fn execute_pipeline(shell: &Shell, commands: &[Vec<&str>]) -> bool {
                     Ok(file) => {
                         process.stdout(Stdio::from(file));
                     }
+
                     Err(e) => {
                         eprintln!("rc9: {e}");
                         return false;
@@ -390,6 +411,7 @@ fn execute_pipeline(shell: &Shell, commands: &[Vec<&str>]) -> bool {
                     Ok(file) => {
                         process.stdout(Stdio::from(file));
                     }
+
                     Err(e) => {
                         eprintln!("rc9: {e}");
                         return false;
@@ -434,6 +456,188 @@ fn execute_pipeline(shell: &Shell, commands: &[Vec<&str>]) -> bool {
     success
 }
 
+fn needs_more_input(input: &str) -> bool {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut parentheses = 0;
+    let mut escape = false;
+
+    for c in input.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+
+        match c {
+            '\\' => {
+                escape = true;
+            }
+
+            '"' if !single_quoted => {
+                double_quoted = !double_quoted;
+            }
+
+            '\'' if !double_quoted => {
+                single_quoted = !single_quoted;
+            }
+
+            '(' if !single_quoted && !double_quoted => {
+                parentheses += 1;
+            }
+
+            ')' if !single_quoted && !double_quoted && parentheses > 0 => {
+                parentheses -= 1;
+            }
+
+            _ => {}
+        }
+    }
+
+    single_quoted || double_quoted || parentheses > 0
+}
+
+fn execute_input(shell: &mut Shell, input: &str) -> bool {
+    let tokens = tokenize(input);
+
+    if tokens.is_empty() {
+        return true;
+    }
+
+    if tokens.len() >= 3 && tokens[1] == "=" {
+        let name = tokens[0].as_str();
+
+        if tokens[2] == "(" {
+            let mut values = Vec::new();
+            let mut i = 3;
+
+            while i < tokens.len() && tokens[i] != ")" {
+                values.push(tokens[i].clone());
+                i += 1;
+            }
+
+            if i == tokens.len() {
+                eprintln!("rc9: expected ')'");
+                return false;
+            }
+
+            shell.set_variable(name, values);
+            return true;
+        }
+
+        shell.set_variable(name, vec![tokens[2..].join(" ")]);
+        return true;
+    }
+
+    let mut commands: Vec<Vec<Vec<&str>>> = Vec::new();
+    let mut operators: Vec<&str> = Vec::new();
+
+    let mut pipeline: Vec<Vec<&str>> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+
+    let mut invalid = false;
+
+    for token in &tokens {
+        match token.as_str() {
+            "|" => {
+                if current.is_empty() {
+                    eprintln!("rc9: invalid pipe");
+                    invalid = true;
+                    break;
+                }
+
+                pipeline.push(current);
+                current = Vec::new();
+            }
+
+            "&&" | "||" | ";" => {
+                if current.is_empty() {
+                    eprintln!("rc9: invalid command");
+                    invalid = true;
+                    break;
+                }
+
+                pipeline.push(current);
+                current = Vec::new();
+
+                commands.push(pipeline);
+                pipeline = Vec::new();
+
+                operators.push(token.as_str());
+            }
+
+            _ => {
+                current.push(token.as_str());
+            }
+        }
+    }
+
+    if invalid {
+        return false;
+    }
+
+    if !current.is_empty() {
+        pipeline.push(current);
+    } else if !pipeline.is_empty() {
+        eprintln!("rc9: invalid pipe");
+        return false;
+    }
+
+    if !pipeline.is_empty() {
+        commands.push(pipeline);
+    }
+
+    if commands.len() != operators.len() + 1 {
+        eprintln!("rc9: invalid command chain");
+        return false;
+    }
+
+    let mut previous_status = true;
+
+    for (index, command) in commands.iter().enumerate() {
+        if index > 0 {
+            let operator = operators[index - 1];
+
+            match operator {
+                "&&" if !previous_status => {
+                    continue;
+                }
+
+                "||" if previous_status => {
+                    continue;
+                }
+
+                _ => {}
+            }
+        }
+
+        previous_status = execute_pipeline(shell, command);
+    }
+
+    previous_status
+}
+
+fn load_rc9rc(shell: &mut Shell) {
+    let Ok(home) = env::var("HOME") else {
+        return;
+    };
+
+    let path = format!("{home}/.rc9rc");
+
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+
+    for line in contents.lines() {
+        let line = line.trim();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        execute_input(shell, line);
+    }
+}
+
 fn main() {
     let home = env::var("HOME").unwrap();
 
@@ -441,122 +645,92 @@ fn main() {
 
     let mut shell = Shell::new();
 
+    load_rc9rc(&mut shell);
+
+    let mut rl = rustyline::DefaultEditor::new().unwrap();
+
+    let history_path = env::var("HOME")
+        .map(|home| format!("{home}/.rc9_history"))
+        .unwrap();
+
+    if let Err(e) = rl.load_history(&history_path) {
+        if !matches!(
+            e,
+            ReadlineError::Io(ref error)
+                if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            eprintln!("rc9: failed to load history: {e}");
+        }
+    }
+
     loop {
         let dir = env::current_dir().unwrap();
+        let prompt = format!("{}% ", dir.display());
 
-        print!("{}% ", dir.display());
-        io::stdout().flush().unwrap();
+        let mut input = match rl.readline(&prompt) {
+            Ok(input) => input,
 
-        let mut input = String::new();
-
-        if io::stdin().read_line(&mut input).is_err() {
-            break;
-        }
-
-        let input = input.trim();
-
-        if input.is_empty() {
-            continue;
-        }
-
-        if input == "exit" {
-            break;
-        }
-
-        let tokens = tokenize(input);
-
-        if tokens.len() == 1 && tokens[0].contains('=') {
-            let parts: Vec<&str> = tokens[0].splitn(2, '=').collect();
-
-            if parts.len() == 2 && !parts[0].is_empty() {
-                shell.set_variable(parts[0], parts[1]);
+            Err(ReadlineError::Interrupted) => {
                 continue;
             }
+
+            Err(ReadlineError::Eof) => {
+                break;
+            }
+
+            Err(e) => {
+                eprintln!("rc9: {e}");
+                break;
+            }
+        };
+
+        if input.trim().is_empty() {
+            continue;
         }
 
-        let mut commands: Vec<Vec<Vec<&str>>> = Vec::new();
-        let mut operators: Vec<&str> = Vec::new();
+        let mut cancelled = false;
 
-        let mut pipeline: Vec<Vec<&str>> = Vec::new();
-        let mut current: Vec<&str> = Vec::new();
-
-        let mut invalid = false;
-
-        for token in &tokens {
-            match token.as_str() {
-                "|" => {
-                    if current.is_empty() {
-                        eprintln!("rc9: invalid pipe");
-                        invalid = true;
-                        break;
-                    }
-
-                    pipeline.push(current);
-                    current = Vec::new();
+        while needs_more_input(&input) {
+            match rl.readline("... ") {
+                Ok(line) => {
+                    input.push('\n');
+                    input.push_str(&line);
                 }
 
-                "&&" | "||" | ";" => {
-                    if current.is_empty() {
-                        eprintln!("rc9: invalid command");
-                        invalid = true;
-                        break;
-                    }
-
-                    pipeline.push(current);
-                    current = Vec::new();
-
-                    commands.push(pipeline);
-                    pipeline = Vec::new();
-
-                    operators.push(token.as_str());
+                Err(ReadlineError::Interrupted) => {
+                    cancelled = true;
+                    break;
                 }
 
-                _ => {
-                    current.push(token.as_str());
+                Err(ReadlineError::Eof) => {
+                    cancelled = true;
+                    break;
+                }
+
+                Err(e) => {
+                    eprintln!("rc9: {e}");
+                    cancelled = true;
+                    break;
                 }
             }
         }
 
-        if invalid {
+        if cancelled {
             continue;
         }
 
-        if !current.is_empty() {
-            pipeline.push(current);
-        } else if !pipeline.is_empty() {
-            eprintln!("rc9: invalid pipe");
-            continue;
+        if let Err(e) = rl.add_history_entry(input.as_str()) {
+            eprintln!("rc9: failed to add history: {e}");
         }
 
-        if !pipeline.is_empty() {
-            commands.push(pipeline);
+        if input.trim() == "exit" {
+            break;
         }
 
-        if commands.len() != operators.len() + 1 {
-            eprintln!("rc9: invalid command chain");
-            continue;
-        }
+        execute_input(&mut shell, &input);
+    }
 
-        let mut previous_status = true;
-
-        for (index, command) in commands.iter().enumerate() {
-            if index > 0 {
-                let operator = operators[index - 1];
-
-                match operator {
-                    "&&" if !previous_status => {
-                        continue;
-                    }
-
-                    "||" if previous_status => {
-                        continue;
-                    }
-
-                    _ => {}
-                }
-            }
-
-            previous_status = execute_pipeline(&shell, command);
-        }
+    if let Err(e) = rl.save_history(&history_path) {
+        eprintln!("rc9: failed to save history: {e}");
     }
 }
